@@ -49,7 +49,7 @@ abstract class Mh160 : KeiSource() {
         readTimeout(20, TimeUnit.SECONDS)
         addInterceptor(::imageInterceptor)
     }
-    
+
     private fun imageInterceptor(chain: Interceptor.Chain): Response {
         val original = chain.request()
         val host = original.url.host
