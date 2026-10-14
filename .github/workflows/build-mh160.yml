@@ -26,10 +26,12 @@ jobs:
       - name: Build Manga160 Release
         run: ./gradlew :src:zh:mh160:assembleRelease
 
-      - name: Upload APK
+      - name: Upload APK and JAR
         uses: actions/upload-artifact@v4
         with:
-          name: Manga160-APK
-          path: src/zh/mh160/build/outputs/apk/release/*.apk
+          name: Manga160-Build
+          path: |
+            src/zh/mh160/build/outputs/apk/release/*.apk
+            src/zh/mh160/build/outputs/jar/release/*.jar
           if-no-files-found: error
 
