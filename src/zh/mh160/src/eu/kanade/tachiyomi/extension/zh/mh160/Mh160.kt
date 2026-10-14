@@ -46,7 +46,9 @@ abstract class Mh160 : KeiSource() {
 
     // lazy: avoids touching baseUrl before the parent class is fully initialized
     
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
+    override fun 
+OkHttpClient.Builder.configureClient(): 
+OkHttpClient.Builder = apply {
         connectTimeout(6, TimeUnit.SECONDS)
         readTimeout(20, TimeUnit.SECONDS)
         addInterceptor(::imageInterceptor)
