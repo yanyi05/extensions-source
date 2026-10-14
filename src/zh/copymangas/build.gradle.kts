@@ -32,3 +32,11 @@ android {
         }
     }
 }
+
+android {
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+        }
+    }
+}
