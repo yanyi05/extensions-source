@@ -148,9 +148,10 @@ abstract class Mh160 : KeiSource() {
             throw Exception("该章节已下架")
         }
         val chapterId = PID_REGEX.find(html)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-        // Mirror f_qTcms_Pic_curUrl_realpic() in the site's show.js.
+
+        // Match the host selection behavior in the site's show.js.
         val host = if (chapterId > 542724) {
-            IMAGE_HOSTS[(chapterId % IMAGE_HOSTS.size).toInt()]
+            IMAGE_HOSTS.random()
         } else {
             LEGACY_IMAGE_HOST
         }
