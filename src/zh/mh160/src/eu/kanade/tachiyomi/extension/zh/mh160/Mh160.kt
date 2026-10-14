@@ -45,15 +45,13 @@ abstract class Mh160 : KeiSource() {
     private val refererValue: String get() = baseUrl.trimEnd('/') + "/"
 
     // lazy: avoids touching baseUrl before the parent class is fully initialized
-    
-    override fun 
-OkHttpClient.Builder.configureClient(): 
+
+    override fun OkHttpClient.Builder.configureClient(): 
 OkHttpClient.Builder = apply {
         connectTimeout(6, TimeUnit.SECONDS)
         readTimeout(20, TimeUnit.SECONDS)
         addInterceptor(::imageInterceptor)
     }
-
 
     // ---------------------------------------------------------------- image node handling
 
