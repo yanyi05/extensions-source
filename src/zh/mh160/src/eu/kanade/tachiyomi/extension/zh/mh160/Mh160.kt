@@ -47,50 +47,52 @@ abstract class Mh160 : KeiSource() {
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
         connectTimeout(6, TimeUnit.SECONDS)
         readTimeout(20, TimeUnit.SECONDS)
-        addInterceptor(::imageInterceptor)
+        addInterceptor(ImageFailoverInterceptor())
     }
 
-    private fun imageInterceptor(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val host = original.url.host
+    private inner class ImageFailoverInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val original = chain.request()
+            val host = original.url.host
 
-        val isImageHost = host in IMAGE_HOST_NAMES
-        if (!isImageHost && host != LEGACY_HOST_NAME) return chain.proceed(original)
+            val isImageHost = host in IMAGE_HOST_NAMES
+            if (!isImageHost && host != LEGACY_HOST_NAME) return chain.proceed(original)
 
-        val base = original.newBuilder().header("Referer", refererValue).build()
+            val base = original.newBuilder().header("Referer", refererValue).build()
 
-        // The legacy host has no known mirrors: only add the Referer.
-        if (!isImageHost) return chain.proceed(base)
+            // The legacy host has no known mirrors: only add the Referer.
+            if (!isImageHost) return chain.proceed(base)
 
-        // Current host first, then the others in random order; recently failed hosts go last.
-        val candidates = (listOf(host) + IMAGE_HOST_NAMES.filter { it != host }.shuffled())
-            .sortedBy { isCoolingDown(it) } // stable sort keeps the order above within a group
-            .take(MAX_ATTEMPTS)
+            // Current host first, then the others in random order; recently failed hosts go last.
+            val candidates = (listOf(host) + IMAGE_HOST_NAMES.filter { it != host }.shuffled())
+                .sortedBy { isCoolingDown(it) } // stable sort keeps the order above within a group
+                .take(MAX_ATTEMPTS)
 
-        var lastError: IOException? = null
-        for (candidate in candidates) {
-            if (chain.call().isCanceled()) throw IOException("Canceled")
-            val request = base.newBuilder()
-                .url(base.url.newBuilder().host(candidate).build())
-                .build()
-            try {
-                val response = chain.proceed(request)
-                if (response.isSuccessful) {
-                    FAILED_AT.remove(candidate)
-                    return response
+            var lastError: IOException? = null
+            for (candidate in candidates) {
+                if (chain.call().isCanceled()) throw IOException("Canceled")
+                val request = base.newBuilder()
+                    .url(base.url.newBuilder().host(candidate).build())
+                    .build()
+                try {
+                    val response = chain.proceed(request)
+                    if (response.isSuccessful) {
+                        FAILED_AT.remove(candidate)
+                        return response
+                    }
+                    val code = response.code
+                    response.close()
+                    // Only blame the node for errors that look node-related, not plain 404s.
+                    if (code >= 500 || code == 403 || code == 408 || code == 429) markFailed(candidate)
+                    lastError = IOException("HTTP $code @ $candidate")
+                } catch (e: IOException) {
+                    if (chain.call().isCanceled()) throw e
+                    markFailed(candidate)
+                    lastError = e
                 }
-                val code = response.code
-                response.close()
-                // Only blame the node for errors that look node-related, not plain 404s.
-                if (code >= 500 || code == 403 || code == 408 || code == 429) markFailed(candidate)
-                lastError = IOException("HTTP $code @ $candidate")
-            } catch (e: IOException) {
-                if (chain.call().isCanceled()) throw e
-                markFailed(candidate)
-                lastError = e
             }
+            throw lastError ?: IOException("所有图片节点均不可用")
         }
-        throw lastError ?: IOException("所有图片节点均不可用")
     }
 
     private fun markFailed(host: String) {
@@ -104,7 +106,7 @@ abstract class Mh160 : KeiSource() {
 
     /** Pick a random healthy node; if every node is cooling down, pick any. */
     private fun pickImageHost(): String {
-        val healthy = IMAGE_HOST_NAMES.filterNot(::isCoolingDown)
+        val healthy = IMAGE_HOST_NAMES.filterNot { isCoolingDown(it) }
         return "https://" + (healthy.ifEmpty { IMAGE_HOST_NAMES }).random()
     }
 
