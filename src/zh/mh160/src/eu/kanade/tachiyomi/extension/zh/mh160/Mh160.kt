@@ -15,19 +15,105 @@ import keiyoushi.utils.firstInstanceOrNull
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /**
  * 漫画160 runs the "qingtiancms" (qTcms) reader: each chapter page embeds a base64 string of
  * image paths separated by `$qingtiandy$`, and the reader JS picks an image host based on the
  * chapter id.
+ *
+ * Image loading optimizations:
+ *  1. Referer is always sent to the image CDN (anti-hotlinking).
+ *  2. Short connect timeout so a dead node fails fast.
+ *  3. Per-request failover: if a node fails, the same image path is retried on other nodes.
+ *  4. Node health memory: a node that failed recently is skipped for a cooldown period,
+ *     both when choosing the chapter's host and when failing over.
  */
 @Source
 abstract class Mh160 : KeiSource() {
 
     private val mobileUrl: String get() = baseUrl.replace("www.", "m.")
+
+    private val refererValue: String get() = baseUrl.trimEnd('/') + "/"
+
+    // lazy: avoids touching baseUrl before the parent class is fully initialized
+    override val client: OkHttpClient by lazy {
+        super.client.newBuilder()
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .addInterceptor(::imageInterceptor)
+            .build()
+    }
+
+    // ---------------------------------------------------------------- image node handling
+
+    private fun imageInterceptor(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val host = original.url.host
+
+        val isImageHost = host in IMAGE_HOST_NAMES
+        if (!isImageHost && host != LEGACY_HOST_NAME) return chain.proceed(original)
+
+        val base = original.newBuilder().header("Referer", refererValue).build()
+
+        // The legacy host has no known mirrors: only add the Referer.
+        if (!isImageHost) return chain.proceed(base)
+
+        // Current host first, then the others in random order; recently failed hosts go last.
+        val candidates = (listOf(host) + IMAGE_HOST_NAMES.filter { it != host }.shuffled())
+            .sortedBy { isCoolingDown(it) } // stable sort keeps the order above within a group
+            .take(MAX_ATTEMPTS)
+
+        var lastError: IOException? = null
+        for (candidate in candidates) {
+            if (chain.call().isCanceled()) throw IOException("Canceled")
+            val request = base.newBuilder()
+                .url(base.url.newBuilder().host(candidate).build())
+                .build()
+            try {
+                val response = chain.proceed(request)
+                if (response.isSuccessful) {
+                    FAILED_AT.remove(candidate)
+                    return response
+                }
+                val code = response.code
+                response.close()
+                // Only blame the node for errors that look node-related, not plain 404s.
+                if (code >= 500 || code == 403 || code == 408 || code == 429) markFailed(candidate)
+                lastError = IOException("HTTP $code @ $candidate")
+            } catch (e: IOException) {
+                if (chain.call().isCanceled()) throw e
+                markFailed(candidate)
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("所有图片节点均不可用")
+    }
+
+    private fun markFailed(host: String) {
+        FAILED_AT[host] = System.currentTimeMillis()
+    }
+
+    private fun isCoolingDown(host: String): Boolean {
+        val failedAt = FAILED_AT[host] ?: return false
+        return System.currentTimeMillis() - failedAt < COOLDOWN_MS
+    }
+
+    /** Pick a random healthy node; if every node is cooling down, pick any. */
+    private fun pickImageHost(): String {
+        val healthy = IMAGE_HOST_NAMES.filterNot(::isCoolingDown)
+        return "https://" + (healthy.ifEmpty { IMAGE_HOST_NAMES }).random()
+    }
+
+    // ---------------------------------------------------------------- lists
 
     override suspend fun getPopularManga(page: Int): MangasPage = parseMobileList("$mobileUrl/kanmanhua/zaixian_hit.html")
 
@@ -93,6 +179,8 @@ abstract class Mh160 : KeiSource() {
         return MangasPage(mangas, hasNextPage = false)
     }
 
+    // ---------------------------------------------------------------- details & chapters
+
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) return null
         val match = MANGA_URL_REGEX.find(url.encodedPath) ?: return null
@@ -139,6 +227,8 @@ abstract class Mh160 : KeiSource() {
         }
     }
 
+    // ---------------------------------------------------------------- pages
+
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val html = client.get(baseUrl + chapter.url).use { it.body.string() }
         val encoded = MURL_REGEX.find(html)?.groupValues?.get(1)
@@ -149,12 +239,8 @@ abstract class Mh160 : KeiSource() {
         }
         val chapterId = PID_REGEX.find(html)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
 
-        // Match the host selection behavior in the site's show.js.
-        val host = if (chapterId > 542724) {
-            IMAGE_HOSTS.random()
-        } else {
-            LEGACY_IMAGE_HOST
-        }
+        // Match the host selection behavior in the site's show.js, but skip nodes that failed recently.
+        val host = if (chapterId > 542724) pickImageHost() else LEGACY_IMAGE_HOST
 
         return decoded.split(PATH_SEPARATOR)
             .filter { it.isNotBlank() }
@@ -177,6 +263,7 @@ abstract class Mh160 : KeiSource() {
     companion object {
         private const val PATH_SEPARATOR = "\$qingtiandy\$"
         private const val LEGACY_IMAGE_HOST = "https://mhpic6.tgmhfc.uk"
+        private const val LEGACY_HOST_NAME = "mhpic6.tgmhfc.uk"
         private val IMAGE_HOSTS = listOf(
             "https://mhpic5er.tgmhfc.uk",
             "https://mhpic789-5.tgmhfc.uk",
@@ -184,6 +271,13 @@ abstract class Mh160 : KeiSource() {
             "https://mhpicwt.tgmhfc.uk",
             "https://mhpicwx.tgmhfc.uk",
         )
+        private val IMAGE_HOST_NAMES = IMAGE_HOSTS.map { it.removePrefix("https://") }
+
+        // Failover tuning
+        private const val MAX_ATTEMPTS = 3
+        private const val COOLDOWN_MS = 5 * 60 * 1000L
+        private val FAILED_AT = ConcurrentHashMap<String, Long>()
+
         private val MANGA_URL_REGEX = Regex("""^/kanmanhua/([A-Za-z0-9]+)/?""")
         private val MURL_REGEX = Regex("""qTcms_S_m_murl_e\s*=\s*"([^"]+)"""")
         private val PID_REGEX = Regex("""qTcms_S_p_id\s*=\s*"(\d+)"""")
